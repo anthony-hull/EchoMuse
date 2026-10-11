@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### New
+
+- **Single sign-on with OpenID Connect.** The dashboard can sign people in through Authentik, Keycloak, Authelia or any OpenID Connect provider. Group membership at the provider sets the role (admin or read-only), and an account is created the first time someone signs in. Someone in no mapped group cannot sign in. Off unless `OIDC_ISSUER` is set; password sign-in is unchanged unless you turn it off with `OIDC_PASSWORD_LOGIN=false`. See Configuration → Single sign-on.
+
 ## 2.26.0
 
 Bluetooth connections, Sendspin, emOS updates from the dashboard, and the nearest Echo answers. Pair with firmware v2.18.0, which this controller offers.
