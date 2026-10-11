@@ -171,6 +171,29 @@ def config_from_env(env: Mapping[str, str]) -> Optional[OidcConfig]:
     )
 
 
+# ─── Flow cookie ──────────────────────────────────────────────────────────────
+
+FLOW_COOKIE = "em_oidc_state"
+FLOW_COOKIE_PATH = "/api/auth/oidc"
+
+
+def flow_cookie(cfg: OidcConfig) -> tuple[str, str, bool]:
+    """
+    (name, path, secure) for the cookie that binds a callback to the browser
+    that started the sign-in.
+
+    Over https it carries the `__Host-` prefix, which makes the browser
+    refuse a cookie set with a Domain attribute. Without it a page on any
+    sibling subdomain can plant a cookie of the same name for the whole
+    parent domain and pair a victim's callback with the attacker's own
+    state. The prefix requires Secure and Path=/, so plain-http loopback —
+    which cannot be Secure — keeps the unprefixed name and the narrow path.
+    """
+    if cfg.redirect_uri.startswith("https://"):
+        return f"__Host-{FLOW_COOKIE}", "/", True
+    return FLOW_COOKIE, FLOW_COOKIE_PATH, False
+
+
 # ─── Authorisation ────────────────────────────────────────────────────────────
 
 def role_for_groups(groups: Any, cfg: OidcConfig) -> Optional[str]:
@@ -362,6 +385,13 @@ async def discover(cfg: OidcConfig) -> Endpoints:
     token_ep = doc.get("token_endpoint")
     if not isinstance(auth_ep, str) or not isinstance(token_ep, str):
         raise OidcError("discovery document lacks the endpoints we need")
+    # The secret and the code go to token_endpoint, and the ID token is
+    # believed without a signature check because it arrives over TLS from
+    # there. An endpoint that is not encrypted voids both. Same-origin is
+    # not required: some providers split hosts legitimately.
+    for name, url in (("authorization", auth_ep), ("token", token_ep)):
+        if not _issuer_is_acceptable(url):
+            raise OidcError(f"discovery {name}_endpoint is not https")
     return Endpoints(auth_ep, token_ep)
 
 
@@ -393,7 +423,10 @@ async def exchange_code(cfg: OidcConfig, endpoints: Endpoints, *,
     }
     try:
         async with aiohttp.ClientSession(timeout=_timeout()) as session:
-            async with session.post(endpoints.token_endpoint, data=form) as resp:
+            # No redirects: a 307/308 would re-send the client secret and
+            # the code, body included, to wherever it points.
+            async with session.post(endpoints.token_endpoint, data=form,
+                                    allow_redirects=False) as resp:
                 if resp.status != 200:
                     raise OidcError(f"token endpoint returned HTTP {resp.status}")
                 body = await resp.json(content_type=None)

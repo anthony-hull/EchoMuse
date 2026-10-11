@@ -32,6 +32,7 @@ import em_oidc
 ISSUER = "https://auth.example.test/application/o/echomuse/"
 CALLBACK = "https://echomuse.example.test/api/auth/oidc/callback"
 LANDING = "https://echomuse.example.test/"
+COOKIE = "__Host-em_oidc_state"
 AUTHORIZE = "https://auth.example.test/authorize/"
 
 
@@ -103,13 +104,13 @@ async def start_flow(client, provider, **claim_over):
         "preferred_username": "anthony", "groups": ["Family"],
     }
     provider.claims.update(claim_over)
-    return state, resp.cookies["em_oidc_state"].value, nonce
+    return state, resp.cookies[COOKIE].value, nonce
 
 
 def callback(client, state, cookie, **extra):
     params = {"code": "auth-code", "state": state, **extra}
     return client.get("/api/auth/oidc/callback", params=params,
-                      cookies={"em_oidc_state": cookie} if cookie else {},
+                      cookies={COOKIE: cookie} if cookie else {},
                       allow_redirects=False)
 
 
@@ -165,7 +166,7 @@ def test_login_route_is_absent_when_oidc_is_off(env, monkeypatch):
 def test_login_redirects_to_the_provider_and_sets_a_flow_cookie(env):
     async def body(client):
         resp = await client.get("/api/auth/oidc/login", allow_redirects=False)
-        return resp.status, resp.headers["Location"], resp.cookies["em_oidc_state"]
+        return resp.status, resp.headers["Location"], resp.cookies[COOKIE]
     status, location, cookie = run(body)
 
     assert status == 302
@@ -173,6 +174,8 @@ def test_login_redirects_to_the_provider_and_sets_a_flow_cookie(env):
     q = parse_qs(urlsplit(location).query)
     assert cookie.value == q["state"][0]
     assert cookie["httponly"]
+    assert cookie["path"] == "/", "__Host- cookies must be scoped to /"
+    assert not cookie["domain"], "__Host- cookies must not carry a Domain"
     assert cookie["samesite"].lower() == "lax"
     assert cookie["secure"], "the redirect URI is https, so the cookie must be Secure"
 
@@ -218,7 +221,7 @@ def test_the_verifier_sent_to_the_provider_matches_the_challenge(env):
         env.claims = {"iss": ISSUER, "aud": "echomuse", "sub": "s",
                       "exp": 4_000_000_000, "nonce": q["nonce"][0],
                       "groups": ["Family"]}
-        await callback(client, q["state"][0], resp.cookies["em_oidc_state"].value)
+        await callback(client, q["state"][0], resp.cookies[COOKIE].value)
         return q["code_challenge"][0]
     challenge = run(body)
 
@@ -248,6 +251,24 @@ def test_callback_with_someone_elses_cookie_is_refused(env):
     async def body(client):
         state, _, _ = await start_flow(client, env)
         return error_of(await callback(client, state, cookie="attacker-state"))
+    assert run(body) == "expired"
+    assert env.exchanges == []
+
+
+def test_a_cookie_planted_under_the_old_name_is_not_honoured(env):
+    # A sibling subdomain can set `em_oidc_state` for the whole parent
+    # domain; only the __Host- name is immune to that, so the callback must
+    # not fall back to the unprefixed one.
+    async def body(client):
+        resp = await client.get("/api/auth/oidc/login", allow_redirects=False)
+        state = parse_qs(urlsplit(resp.headers["Location"]).query)["state"][0]
+        env.claims = {"iss": ISSUER, "aud": "echomuse", "sub": "s",
+                      "exp": 4_000_000_000, "nonce": "x", "groups": ["Family"]}
+        planted = await client.get(
+            "/api/auth/oidc/callback",
+            params={"code": "c", "state": state},
+            cookies={"em_oidc_state": state}, allow_redirects=False)
+        return error_of(planted)
     assert run(body) == "expired"
     assert env.exchanges == []
 

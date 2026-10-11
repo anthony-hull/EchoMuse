@@ -191,3 +191,39 @@ def test_a_local_admin_is_untouched_by_oidc_accounts(fresh_db):
 
     assert db.get_user_by_id(local)["role"] == "admin"
     assert db.admin_count() == 1
+
+
+def test_two_simultaneous_first_sign_ins_make_one_account_not_a_500(fresh_db, monkeypatch):
+    # Both requests look the person up, both find nothing, both try to
+    # create. The unique index lets exactly one in; the other must carry on
+    # as an ordinary sign-in rather than surfacing the constraint error.
+    db.create_oidc_user(ISSUER, "sub-1", "anthony", "readonly")
+    real = db.get_user_by_oidc
+    calls = {"n": 0}
+
+    def stale_first_lookup(issuer, subject):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else real(issuer, subject)
+    monkeypatch.setattr(db, "get_user_by_oidc", stale_first_lookup)
+
+    token, role = sign_in(identity(), "readonly")
+
+    assert role == "readonly"
+    assert db.get_session(token) is not None
+    assert len(db.get_all_users()) == 1
+
+
+def test_the_race_loser_still_gets_the_role_it_earned(fresh_db, monkeypatch):
+    db.create_oidc_user(ISSUER, "sub-1", "anthony", "readonly")
+    real = db.get_user_by_oidc
+    calls = {"n": 0}
+
+    def stale_first_lookup(issuer, subject):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else real(issuer, subject)
+    monkeypatch.setattr(db, "get_user_by_oidc", stale_first_lookup)
+
+    _, role = sign_in(identity(groups=("Admins",)), "admin")
+
+    assert role == "admin"
+    assert db.get_user_by_oidc(ISSUER, "sub-1")["role"] == "admin"
