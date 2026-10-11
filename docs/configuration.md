@@ -956,6 +956,10 @@ What to know before turning it on:
 - **Keep a local admin.** Leave `OIDC_PASSWORD_LOGIN` on, or at least keep one
   password account, until you have signed in by single sign-on and seen it
   work. If the provider is down, that account is the way back in.
+- **Start sign-in from the address in `OIDC_REDIRECT_URI`.** The browser is
+  sent back to exactly that host, and the cookie that ties the return trip to
+  the sign-in belongs to the host you started from. Starting from a different
+  address (the controller's bare LAN IP, say) ends in "That sign-in expired".
 - A half-set configuration is logged and ignored, so a typo leaves you with
   the password form rather than locked out.
 

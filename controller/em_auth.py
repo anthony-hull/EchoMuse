@@ -30,6 +30,7 @@ import asyncio
 import logging
 import os
 import secrets
+import sqlite3
 from functools import wraps
 from typing import Optional
 
@@ -192,6 +193,32 @@ async def login_via_ingress(identity) -> tuple[str, str]:
 
 
 
+async def _provision_oidc_user(loop, identity, role: str):
+    """
+    Create the account for a first sign-in, or return the one a simultaneous
+    request created a moment earlier.
+
+    Two requests can both look the person up, both find nothing, and both
+    insert. The unique (issuer, subject) index lets exactly one through; the
+    loser re-reads and carries on as an ordinary sign-in, so the person sees
+    a login rather than an internal error. A row that STILL cannot be found
+    after a constraint failure is something else, and is raised.
+    """
+    try:
+        user_id = await loop.run_in_executor(
+            None, db.create_oidc_user,
+            identity.issuer, identity.subject, identity.username, role)
+    except sqlite3.IntegrityError:
+        user = await loop.run_in_executor(
+            None, db.get_user_by_oidc, identity.issuer, identity.subject)
+        if user is None:
+            raise
+        return user
+    user = await loop.run_in_executor(None, db.get_user_by_id, user_id)
+    log.info(f"[auth] OIDC user provisioned: {user['username']} ({role})")
+    return user
+
+
 async def login_via_oidc(identity, role: Optional[str], *,
                          session_hours: float) -> tuple[str, str]:
     """
@@ -228,12 +255,9 @@ async def login_via_oidc(identity, role: Optional[str], *,
                         403)
 
     if user is None:
-        user_id = await loop.run_in_executor(
-            None, db.create_oidc_user,
-            identity.issuer, identity.subject, identity.username, role)
-        user = await loop.run_in_executor(None, db.get_user_by_id, user_id)
-        log.info(f"[auth] OIDC user provisioned: {user['username']} ({role})")
-    elif user["role"] != role:
+        user = await _provision_oidc_user(loop, identity, role)
+
+    if user["role"] != role:
         await loop.run_in_executor(None, db.set_user_role, user["id"], role)
         await loop.run_in_executor(None, db.delete_user_sessions, user["id"])
         log.info(f"[auth] OIDC role change: {user['username']} "
