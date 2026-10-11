@@ -287,22 +287,35 @@ class FakeIssuer:
     """An OpenID provider reduced to what the controller calls."""
 
     def __init__(self, id_token_claims=None, discovery_issuer=None,
-                 token_status=200):
+                 token_status=200, token_endpoint=None,
+                 authorization_endpoint=None, redirect_token_to=None):
         self.id_token_claims = id_token_claims
         self.discovery_issuer = discovery_issuer
         self.token_status = token_status
+        self.token_endpoint = token_endpoint
+        self.authorization_endpoint = authorization_endpoint
+        self.redirect_token_to = redirect_token_to
+        self.landing_requests = []
         self.token_requests = []
         self.base = ""
 
     async def discovery(self, request):
         return web.json_response({
             "issuer": self.discovery_issuer or self.base,
-            "authorization_endpoint": f"{self.base}authorize/",
-            "token_endpoint": f"{self.base}token/",
+            "authorization_endpoint":
+                self.authorization_endpoint or f"{self.base}authorize/",
+            "token_endpoint": self.token_endpoint or f"{self.base}token/",
         })
+
+    async def landing(self, request):
+        self.landing_requests.append(dict(await request.post()))
+        return web.json_response({"id_token": jwt(self.id_token_claims)})
 
     async def token(self, request):
         self.token_requests.append(dict(await request.post()))
+        if self.redirect_token_to:
+            # 307 keeps the method and body, which is what carries the secret.
+            raise web.HTTPTemporaryRedirect(self.redirect_token_to)
         if self.token_status != 200:
             return web.json_response({"error": "invalid_grant"},
                                      status=self.token_status)
@@ -316,6 +329,7 @@ async def with_issuer(issuer, body):
     app = web.Application()
     app.router.add_get("/.well-known/openid-configuration", issuer.discovery)
     app.router.add_post("/token/", issuer.token)
+    app.router.add_post("/elsewhere/", issuer.landing)
     server = TestServer(app)
     await server.start_server()
     try:
@@ -370,3 +384,66 @@ def test_a_refused_code_is_an_oidc_error():
                                            verifier="v")
     with pytest.raises(em_oidc.OidcError):
         asyncio.run(with_issuer(issuer, body))
+
+
+# ── What the discovery document may point us at ───────────────────────────────
+#
+# The client secret and the authorization code go to whatever
+# token_endpoint the discovery document names, and the ID token is trusted
+# without a signature check BECAUSE it arrives over TLS from that endpoint.
+# So the endpoint has to be one that actually gives that guarantee.
+
+@pytest.mark.parametrize("field", ["token_endpoint", "authorization_endpoint"])
+def test_discovery_refuses_a_plain_http_endpoint(field):
+    async def body(cfg):
+        return await em_oidc.discover(cfg)
+    issuer = FakeIssuer(**{field: "http://auth.example.test/endpoint/"})
+    with pytest.raises(em_oidc.OidcError):
+        asyncio.run(with_issuer(issuer, body))
+
+
+def test_discovery_accepts_an_https_endpoint_on_another_host():
+    # Providers such as Google legitimately split hosts, so same-origin is
+    # not required; only that the channel is encrypted.
+    async def body(cfg):
+        return await em_oidc.discover(cfg)
+    issuer = FakeIssuer(token_endpoint="https://tokens.example.test/token")
+    endpoints = asyncio.run(with_issuer(issuer, body))
+    assert endpoints.token_endpoint == "https://tokens.example.test/token"
+
+
+def test_token_request_does_not_follow_a_redirect_with_the_secret():
+    issuer = FakeIssuer()
+
+    async def body(cfg):
+        issuer.redirect_token_to = f"{issuer.base}elsewhere/"
+        issuer.id_token_claims = claims(iss=issuer.base)
+        endpoints = await em_oidc.discover(cfg)
+        return await em_oidc.exchange_code(cfg, endpoints, code="c",
+                                           verifier="v")
+    with pytest.raises(em_oidc.OidcError):
+        asyncio.run(with_issuer(issuer, body))
+    assert issuer.landing_requests == [], \
+        "the redirect target received the client secret"
+
+
+# ── Flow cookie name ──────────────────────────────────────────────────────────
+
+def test_https_flow_cookie_uses_the_host_prefix():
+    # __Host- makes the browser refuse a cookie set with a Domain attribute,
+    # which is how a sibling subdomain would plant one.
+    name, path, secure = em_oidc.flow_cookie(make_config())
+    assert name == "__Host-em_oidc_state"
+    assert path == "/"
+    assert secure is True
+
+
+def test_loopback_http_flow_cookie_keeps_the_narrow_path():
+    # __Host- requires Secure, which a plain-http loopback test setup cannot
+    # have, so this is the only deployment that gets the unprefixed name.
+    cfg = make_config(OIDC_ISSUER="http://127.0.0.1:9000/",
+                      OIDC_REDIRECT_URI="http://127.0.0.1:8768/api/auth/oidc/callback")
+    name, path, secure = em_oidc.flow_cookie(cfg)
+    assert name == "em_oidc_state"
+    assert path == "/api/auth/oidc"
+    assert secure is False

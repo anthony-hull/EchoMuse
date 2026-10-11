@@ -164,8 +164,6 @@ _oidc_exchanges = em_oidc.OneShotStore(em_oidc.EXCHANGE_TTL_S)
 # re-fetched hourly so a provider that rotates endpoints is followed.
 OIDC_DISCOVERY_TTL_S = 3600
 _oidc_discovery_cache: Optional[tuple[em_oidc.Endpoints, float]] = None
-OIDC_FLOW_COOKIE = "em_oidc_state"
-OIDC_COOKIE_PATH = "/api/auth/oidc"
 
 # List endpoint, not /releases/latest: device firmware releases (v* tags with
 # a `server` asset) share the repo with controller releases (controller-v*
@@ -807,7 +805,9 @@ def _oidc_redirect(location: str, *, clear_cookie: bool = False) -> web.Response
     resp = web.Response(status=302, headers={
         "Location": location, "Cache-Control": "no-store"})
     if clear_cookie:
-        resp.del_cookie(OIDC_FLOW_COOKIE, path=OIDC_COOKIE_PATH)
+        name, path, secure = em_oidc.flow_cookie(_oidc_cfg)
+        resp.del_cookie(name, path=path, secure=secure, httponly=True,
+                        samesite="Lax")
     return resp
 
 
@@ -840,9 +840,9 @@ async def _get_oidc_login(request: web.Request) -> web.Response:
     # Binds the callback to THIS browser, so a link sent to someone else
     # cannot sign them in as the sender (login CSRF). Lax, not Strict: the
     # callback is a top-level navigation arriving from another site.
-    resp.set_cookie(OIDC_FLOW_COOKIE, state, max_age=em_oidc.FLOW_TTL_S,
-                    path=OIDC_COOKIE_PATH, httponly=True, samesite="Lax",
-                    secure=cfg.redirect_uri.startswith("https://"))
+    name, path, secure = em_oidc.flow_cookie(cfg)
+    resp.set_cookie(name, state, max_age=em_oidc.FLOW_TTL_S, path=path,
+                    httponly=True, samesite="Lax", secure=secure)
     return resp
 
 
@@ -859,7 +859,7 @@ async def _get_oidc_callback(request: web.Request) -> web.Response:
         return _error("oidc_disabled", "Single sign-on is not configured", 404)
 
     state = request.query.get("state", "")
-    cookie = request.cookies.get(OIDC_FLOW_COOKIE, "")
+    cookie = request.cookies.get(em_oidc.flow_cookie(cfg)[0], "")
     # Popped before anything else is checked, so a state is spent whether the
     # attempt succeeds or not.
     flow = _oidc_flows.pop(state) if state else None
